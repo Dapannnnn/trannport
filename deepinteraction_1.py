@@ -1,0 +1,331 @@
+import mmcv
+import copy
+import torch
+from mmcv.parallel import DataContainer as DC
+from mmcv.runner import force_fp32
+from os import path as osp
+from torch import nn as nn
+from torch.nn import functional as F
+
+from mmdet3d.core import (Box3DMode, Coord3DMode, bbox3d2result,
+                          merge_aug_bboxes_3d, show_result)
+from mmdet3d.ops import Voxelization
+from mmdet.core import multi_apply
+from mmdet.models import DETECTORS
+from mmdet3d.models import builder
+from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
+import pdb
+
+
+@DETECTORS.register_module()
+class DeepInteraction(MVXTwoStageDetector):
+    """Base class of Multi-modality VoxelNet."""
+
+    def __init__(self,
+                 freeze_img=False,
+                 freeze_pts=False,
+                 pts_pillar_layer=None,
+                 pts_voxel_layer=None,
+                 pts_voxel_encoder=None,
+                 pts_pillar_encoder=None,
+                 pts_middle_encoder=None,
+                 pts_fusion_layer=None,
+                 img_backbone=None,
+                 pts_backbone=None,
+                 img_neck=None,
+                 pts_neck=None,
+                 imgpts_neck=None,
+                 pts_bbox_head=None,
+                 img_roi_head=None,
+                 img_rpn_head=None,
+                 train_cfg=None,
+                 test_cfg=None,
+                 pretrained=None,
+                 init_cfg=None):
+        super(DeepInteraction, self).__init__(pts_voxel_layer, pts_voxel_encoder,
+                             pts_middle_encoder, pts_fusion_layer,
+                             img_backbone, pts_backbone, img_neck, pts_neck,
+                             pts_bbox_head, img_roi_head, img_rpn_head,
+                             train_cfg, test_cfg, pretrained, init_cfg)
+        
+        self.pts_pillar_layer = Voxelization(**pts_pillar_layer)
+        self.imgpts_neck = builder.build_neck(imgpts_neck)
+        if pts_pillar_encoder is not None:
+            self.pts_pillar_encoder = builder.build_voxel_encoder(pts_pillar_encoder)
+        
+        self.freeze_img = freeze_img
+        self.freeze_pts = freeze_pts
+        
+    def init_weights(self):
+        """Initialize model weights."""
+        super(DeepInteraction, self).init_weights()
+        if self.freeze_img:
+            if self.with_img_backbone:
+                for param in self.img_backbone.parameters():
+                    param.requires_grad = False
+            if self.with_img_neck:
+                for param in self.img_neck.parameters():
+                    param.requires_grad = False
+        
+        if self.freeze_pts:
+            for name, param in self.named_parameters():
+                if 'pts' in name and 'pts_bbox_head' not in name and 'imgpts_neck' not in name:
+                    param.requires_grad = False
+                if 'pts_bbox_head.decoder.0' in name:
+                    param.requires_grad = False
+                if 'imgpts_neck.shared_conv_pts' in name:
+                    param.requires_grad = False
+                if 'pts_bbox_head.heatmap_head' in name and 'pts_bbox_head.heatmap_head_img' not in name:
+                    param.requires_grad = False
+                if 'pts_bbox_head.prediction_heads.0' in name:
+                    param.requires_grad = False
+                if 'pts_bbox_head.class_encoding' in name:
+                    param.requires_grad = False
+            def fix_bn(m):
+                if isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d):
+                    m.track_running_stats = False
+            self.pts_voxel_layer.apply(fix_bn)
+            self.pts_voxel_encoder.apply(fix_bn)
+            self.pts_middle_encoder.apply(fix_bn)
+            self.pts_backbone.apply(fix_bn)
+            self.pts_neck.apply(fix_bn)
+            # self.pts_bbox_head.heatmap_head.apply(fix_bn)
+            # self.pts_bbox_head.class_encoding.apply(fix_bn)
+            # self.pts_bbox_head.decoder[0].apply(fix_bn)
+            # self.pts_bbox_head.prediction_heads[0].apply(fix_bn)
+            self.imgpts_neck.shared_conv_pts.apply(fix_bn)
+
+
+    def extract_img_feat(self, img, img_metas):
+        """Extract features of images."""
+        if self.with_img_backbone and img is not None:
+            input_shape = img.shape[-2:]
+            # update real input shape of each single img
+            for img_meta in img_metas:
+                img_meta.update(input_shape=input_shape)
+
+            if img.dim() == 5 and img.size(0) == 1:
+                img.squeeze_(0)
+            elif img.dim() == 5 and img.size(0) > 1:
+                B, N, C, H, W = img.size()
+                img = img.view(B * N, C, H, W)
+            img_feats = self.img_backbone(img.float())
+        else:
+            return None
+        if self.with_img_neck:
+            img_feats = self.img_neck(img_feats)
+        return img_feats
+
+    def extract_pts_feat(self, pts, img_feats, img_metas):
+        """Extract features of points."""
+        if not self.with_pts_bbox:
+            return None
+        voxels, num_points, coors = self.voxelize(pts,voxel_type='voxel')
+        voxel_features = self.pts_voxel_encoder(voxels, num_points, coors)
+        batch_size = coors[-1, 0] + 1
+        x = self.pts_middle_encoder(voxel_features, coors, batch_size)
+        x = self.pts_backbone(x)
+        if self.with_pts_neck:
+            x = self.pts_neck(x)
+        
+        pillars, pillars_num_points, pillar_coors = self.voxelize(pts, voxel_type='pillar')
+        if hasattr(self, 'pts_pillar_encoder'):
+            pillar_features = self.pts_pillar_encoder(pillars, pillars_num_points, pillar_coors)
+        else:
+            pillar_features = self.pts_voxel_encoder(pillars, pillars_num_points, pillar_coors)
+        pts_metas = {}
+        pts_metas['pillar_center'] = pillar_features
+        pts_metas['pillars'] = pillars
+        pts_metas['pillars_num_points'] = pillars_num_points
+        pts_metas['pillar_coors'] = pillar_coors
+        pts_metas['pts'] = pts
+        return x, pts_metas
+    
+    def extract_feat(self, points, img, img_metas):
+        img_feats = self.extract_img_feat(img, img_metas)
+        pts_feats, pts_metas = self.extract_pts_feat(points, img_feats, img_metas)
+        new_img_feat, new_pts_feat = self.imgpts_neck(img_feats[0], pts_feats[0], img_metas, pts_metas)
+        return (new_img_feat, new_pts_feat)
+
+    @torch.no_grad()
+    @force_fp32()
+    def voxelize(self, points, voxel_type='voxel'):
+        assert voxel_type=='voxel' or voxel_type=='pillar'
+        voxels, coors, num_points = [], [], []
+        for res in points:
+            if voxel_type == 'voxel':
+                res_voxels, res_coors, res_num_points = self.pts_voxel_layer(res)
+            elif voxel_type == 'pillar':
+                res_voxels, res_coors, res_num_points = self.pts_pillar_layer(res)
+            voxels.append(res_voxels)
+            coors.append(res_coors)
+            num_points.append(res_num_points)
+        voxels = torch.cat(voxels, dim=0)
+        num_points = torch.cat(num_points, dim=0)
+        coors_batch = []
+        for i, coor in enumerate(coors):
+            coor_pad = F.pad(coor, (1, 0), mode='constant', value=i)
+            coors_batch.append(coor_pad)
+        coors_batch = torch.cat(coors_batch, dim=0)
+        return voxels, num_points, coors_batch
+
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None):
+        """Forward training function.
+
+        Args:
+            points (list[torch.Tensor], optional): Points of each sample.
+                Defaults to None.
+            img_metas (list[dict], optional): Meta information of each sample.
+                Defaults to None.
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`], optional):
+                Ground truth 3D boxes. Defaults to None.
+            gt_labels_3d (list[torch.Tensor], optional): Ground truth labels
+                of 3D boxes. Defaults to None.
+            gt_labels (list[torch.Tensor], optional): Ground truth labels
+                of 2D boxes in images. Defaults to None.
+            gt_bboxes (list[torch.Tensor], optional): Ground truth 2D boxes in
+                images. Defaults to None.
+            img (torch.Tensor optional): Images of each sample with shape
+                (N, C, H, W). Defaults to None.
+            proposals ([list[torch.Tensor], optional): Predicted proposals
+                used for training Fast RCNN. Defaults to None.
+            gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
+                2D boxes in images to be ignored. Defaults to None.
+
+        Returns:
+            dict: Losses of different branches.
+        """
+        img_feats, pts_feats = self.extract_feat(
+            points, img=img, img_metas=img_metas)
+        losses = dict()
+        losses_pts = self.forward_pts_train(pts_feats[1], gt_bboxes_3d,
+                                            gt_labels_3d, img_metas,
+                                            gt_bboxes_ignore)
+        losses.update(losses_pts)
+        return losses
+
+    def forward_test(self, img_metas, img=None, **kwargs):
+        for var, name in [(img_metas, 'img_metas')]:
+            if not isinstance(var, list):
+                raise TypeError('{} must be a list, but got {}'.format(
+                    name, type(var)))
+        img = [img] if img is None else img
+
+        if img_metas[0][0]['scene_token'] != self.prev_frame_info['scene_token']:
+            # the first sample of each scene is truncated
+            self.prev_frame_info['prev_bev'] = None
+        # update idx
+        self.prev_frame_info['scene_token'] = img_metas[0][0]['scene_token']
+
+        # do not use temporal information
+        if not self.video_test_mode:
+            self.prev_frame_info['prev_bev'] = None
+
+        # Get the delta of ego position and angle between two timestamps.
+        tmp_pos = copy.deepcopy(img_metas[0][0]['can_bus'][:3])
+        tmp_angle = copy.deepcopy(img_metas[0][0]['can_bus'][-1])
+        if self.prev_frame_info['prev_bev'] is not None:
+            img_metas[0][0]['can_bus'][:3] -= self.prev_frame_info['prev_pos']
+            img_metas[0][0]['can_bus'][-1] -= self.prev_frame_info['prev_angle']
+        else:
+            img_metas[0][0]['can_bus'][-1] = 0
+            img_metas[0][0]['can_bus'][:3] = 0
+
+        new_prev_bev, bbox_results = self.simple_test(
+            img_metas[0], img[0], prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
+        # During inference, we save the BEV features and ego motion of each timestamp.
+        self.prev_frame_info['prev_pos'] = tmp_pos
+        self.prev_frame_info['prev_angle'] = tmp_angle
+        self.prev_frame_info['prev_bev'] = new_prev_bev
+        return bbox_results
+
+    def forward_pts_train(self,
+                          pts_feats,
+                          gt_bboxes_3d,
+                          gt_labels_3d,
+                          img_metas,
+                          gt_bboxes_ignore=None,
+                          prev_bev=None):
+        """Forward function'
+        Args:
+            pts_feats (list[torch.Tensor]): Features of point cloud branch
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`]): Ground truth
+                boxes for each sample.
+            gt_labels_3d (list[torch.Tensor]): Ground truth labels for
+                boxes of each sampole
+            img_metas (list[dict]): Meta information of samples.
+            gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
+                boxes to be ignored. Defaults to None.
+            prev_bev (torch.Tensor, optional): BEV features of previous frame.
+        Returns:
+            dict: Losses of each branch.
+        """
+
+        outs = self.pts_bbox_head(
+            pts_feats, img_metas, prev_bev)
+        loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+        losses = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
+        return losses
+
+    def pred2result(self, bboxes, scores, labels, pts, attrs=None):
+        """Convert detection results to a list of numpy arrays.
+
+        Args:
+            bboxes (torch.Tensor): Bounding boxes with shape of (n, 5).
+            labels (torch.Tensor): Labels with shape of (n, ).
+            scores (torch.Tensor): Scores with shape of (n, ).
+            attrs (torch.Tensor, optional): Attributes with shape of (n, ). \
+                Defaults to None.
+
+        Returns:
+            dict[str, torch.Tensor]: Bounding box results in cpu mode.
+
+                - boxes_3d (torch.Tensor): 3D boxes.
+                - scores (torch.Tensor): Prediction scores.
+                - labels_3d (torch.Tensor): Box labels.
+                - attrs_3d (torch.Tensor, optional): Box attributes.
+        """
+        result_dict = dict(
+            boxes_3d=bboxes.to('cpu'),
+            scores_3d=scores.cpu(),
+            labels_3d=labels.cpu(),
+            pts_3d=pts.to('cpu'))
+
+        if attrs is not None:
+            result_dict['attrs_3d'] = attrs.cpu()
+
+        return result_dict
+
+    def simple_test_pts(self, x, img_metas, prev_bev=None, rescale=False):
+        """Test function"""
+        outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev)
+
+        bbox_list = self.pts_bbox_head.get_bboxes(
+            outs, img_metas, rescale=rescale)
+
+        bbox_results = [
+            self.pred2result(bboxes, scores, labels, pts)
+            for bboxes, scores, labels, pts in bbox_list
+        ]
+        # import pdb;pdb.set_trace()
+        return outs['bev_embed'], bbox_results
+
+    def simple_test(self, img_metas, img=None, prev_bev=None, rescale=False, **kwargs):
+        """Test function without augmentaiton."""
+        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+
+        bbox_list = [dict() for i in range(len(img_metas))]
+        new_prev_bev, bbox_pts = self.simple_test_pts(
+            img_feats, img_metas, prev_bev, rescale=rescale)
+        for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
+            result_dict['pts_bbox'] = pts_bbox
+        return new_prev_bev, bbox_list
